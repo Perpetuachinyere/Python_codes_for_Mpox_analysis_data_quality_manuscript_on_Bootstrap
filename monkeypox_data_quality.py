@@ -7,10 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/16OhTRWTlAeY7mQ-iijgLR66u0YkdoQOl
 """
 
-with open('/content/mpox_analysis_full.py', 'r') as file:
-    content = file.read()
-print(content)
-
 #!/usr/bin/env python3
 """
 ==============================================================================
@@ -617,3 +613,335 @@ if not ARGS.skip_figures:
     ax.set_title('Within-country discrimination, Model B',fontweight='bold'); sv(f,'Fig9_Stratified')
 
 log('ALL SECTIONS COMPLETE')
+
+import os
+R=load(); raw=pd.read_excel(DATA)
+# ---- (1) temporal validation ordered by Date_entry (ordering only; never a feature)
+de=pd.to_datetime(raw['Date_entry'],errors='coerce'); log(f"Date_entry missing: {de.isna().mean():.3%}; range {de.min().date()} to {de.max().date()}")
+order=np.argsort(de.fillna(de.max()).values,kind='stable'); NB=6; blocks=np.array_split(order,NB); T=[]
+for k in range(1,NB):
+    tr=np.concatenate(blocks[:k]); te=blocks[k]; row=dict(block=k+1,n_train=len(tr),n_test=len(te),test_neg=int((1-y[te]).sum()),train_neg=int((1-y[tr]).sum()),
+         start=str(de.iloc[te].min().date()),end=str(de.iloc[te].max().date()))
+    for lab,cty in [('A',True),('B',False)]:
+        try:
+            m=pipe(HG(),country=cty).fit(df.iloc[tr][feats(cty)],y[tr]); p=m.predict_proba(df.iloc[te][feats(cty)])[:,1]
+            row[lab]=roc_auc_score(y[te],p) if 0<y[te].sum()<len(te) else np.nan
+        except Exception as e: row[lab]=np.nan
+    T.append(row); log(f"temporal block {k+1}: {row}")
+R['temporal']=T
+# ---- (2) complete-case analyses (Model B predictors)
+cc={}
+def cca(mask,label):
+    d=df[mask].reset_index(drop=True); yy=d['label'].values; n,neg=len(d),int((1-yy).sum())
+    if neg<10 or yy.sum()<10: cc[label]=(n,neg,np.nan,np.nan,np.nan); return
+    p=cross_val_predict(pipe(HG(),country=False),d[feats(False)],yy,cv=StratifiedKFold(5,shuffle=True,random_state=42),method='predict_proba')[:,1]
+    lo,hi=boot(yy,p,roc_auc_score,300); cc[label]=(n,neg,roc_auc_score(yy,p),lo,hi); log(f"CCA {label}: n={n} neg={neg} AUC={cc[label][2]:.3f} [{lo:.3f},{hi:.3f}]")
+cca(df['age_missing'].values==0,'Age recorded')
+cca((df['age_missing'].values==0)&(df['gender_missing'].values==0),'Age and gender recorded')
+cca(df['sym_any'].values==1,'Any symptom text recorded')
+R['cca']=cc
+save(R)
+
+import sys
+R=load(); cty=df['Country'].values; codes,uni=pd.factorize(cty); idx_by=[np.where(codes==g)[0] for g in range(len(uni))]
+GRIDH={'clf__learning_rate':[0.05,0.1],'clf__max_depth':[3,5]}
+rng=np.random.RandomState(42); res={'A':[],'B':[]}
+NREP = NREP_OOB if 'NREP_OOB' in globals() else 36
+for b in range(NREP):
+    gs_=np.unique(rng.choice(len(uni),len(uni),replace=True)); oob=np.setdiff1d(np.arange(len(uni)),gs_)
+    tr=np.concatenate([idx_by[g] for g in gs_]); te=np.concatenate([idx_by[g] for g in oob])
+    if y[te].sum()<20 or (1-y[te]).sum()<20 or (1-y[tr]).sum()<50: continue
+    for lab,c in [('A',True),('B',False)]:
+        gs=GridSearchCV(pipe(HG(),country=c),GRIDH,cv=INN,scoring='roc_auc').fit(df.iloc[tr][feats(c)],y[tr])
+        res[lab].append(roc_auc_score(y[te],gs.predict_proba(df.iloc[te][feats(c)])[:,1]))
+    if b%10==9: log(f"rep {b+1}/{NREP} kept A={len(res['A'])} ")
+R['oob']={k:(len(v),float(np.mean(v)),float(np.percentile(v,2.5)),float(np.percentile(v,97.5)),float(np.std(v,ddof=1))) for k,v in res.items()}
+R['oob_raw']=res; save(R); log(f"OOB unseen-country bootstrap: {R['oob']}")
+
+R=load(); m=df['sym_any'].values==1; d=df[m].reset_index(drop=True); yy=d['label'].values
+print("symptom-recorded records:",len(d),"| negatives:",int((1-yy).sum()))
+print(d.groupby('Country')['label'].agg(['count','sum']).assign(neg=lambda t:t['count']-t['sum']).sort_values('count',ascending=False).head(8).to_string())
+print("sources in subset:",d['Source'].nunique() if 'Source' in d else 'n/a')
+def run(cols,label):
+    X=d[cols].copy();
+    pre=ColumnTransformer([('s',StandardScaler(),cols)])
+    p=cross_val_predict(Pipeline([('pre',pre),('clf',LogisticRegression(max_iter=2000,C=0.3))]),X.fillna(0),yy,cv=StratifiedKFold(5,shuffle=True,random_state=42),method='predict_proba')[:,1]
+    lo,hi=boot(yy,p,roc_auc_score,300); r=(label,roc_auc_score(yy,p),lo,hi); print(f"{label}: AUC={r[1]:.3f} [{lo:.3f},{hi:.3f}]"); return r
+SYM8=[c for c in SYM if c!='sym_any']
+R['cca_models']=[run(SYM8,'Symptom indicators only (within symptom-recorded records)'),run(['Age_numeric','Gender_bin']+FLAGS,'Age/gender only (same records)')]
+print("symptom prevalence by class:"); print(d.groupby('label')[SYM8].mean().round(2).T.to_string())
+save(R)
+
+# 3. Paired bootstrap AUC(A)-AUC(B); leave-one-country-out validation
+
+# ==========================================================================
+# 3. Paired bootstrap AUC(A)-AUC(B); leave-one-country-out validation
+# ==========================================================================
+R = load()
+
+# Paired bootstrap: calculate only if not already available
+if 'paired' not in R:
+    R['paired'] = {}
+    for nm in CLFS:
+        rng = np.random.RandomState(42)
+        d = []
+        for _ in range(1000):
+            i = rng.choice(len(y), len(y), replace=True)
+            d.append(
+                roc_auc_score(y[i], R['A'][nm]['probs'][i])
+                - roc_auc_score(y[i], R['B'][nm]['probs'][i])
+            )
+        R['paired'][nm] = (
+            np.mean(d),
+            np.percentile(d, 2.5),
+            np.percentile(d, 97.5)
+        )
+    save(R)
+    log("Paired bootstrap completed")
+
+# --------------------------------------------------------------------------
+# Country-specific leave-one-country-out (LOCO) analysis
+# --------------------------------------------------------------------------
+# Include countries with at least 30 records, consistent with the
+# original pooled LOCO analysis.
+if 'loco_detail' not in R:
+
+    country_counts = df.groupby('Country').size()
+    eligible_countries = country_counts[country_counts >= 30].index
+
+    use = df['Country'].isin(eligible_countries).values
+    dfl = df.loc[use].reset_index(drop=True)
+
+    yl = dfl['label'].values
+    groups = dfl['Country'].values
+
+    loco_detail = {'A': [], 'B': []}
+    pooled = {}
+
+    # Same HistGradientBoosting specification as the original LOCO analysis
+    HG = lambda: HistGradientBoostingClassifier(
+        max_iter=100,
+        learning_rate=0.05,
+        max_depth=3,
+        random_state=42
+    )
+
+    for lab, include_country in [('A', True), ('B', False)]:
+
+        pred = np.full(len(dfl), np.nan)
+        X_loco = dfl[feats(include_country)]
+
+        logo = LeaveOneGroupOut()
+
+        for train_idx, test_idx in logo.split(
+            X_loco, yl, groups
+        ):
+
+            y_train = yl[train_idx]
+            y_test = yl[test_idx]
+
+            # Ensure that the training data contain both classes
+            if len(np.unique(y_train)) < 2:
+                continue
+
+            # Fit preprocessing and model using training countries only
+            model = pipe(
+                HG(),
+                country=include_country
+            )
+
+            model.fit(
+                X_loco.iloc[train_idx],
+                y_train
+            )
+
+            # Predict the held-out country
+            pred[test_idx] = model.predict_proba(
+                X_loco.iloc[test_idx]
+            )[:, 1]
+
+            country = str(groups[test_idx][0])
+
+            # Country-specific ROC-AUC is defined only when both
+            # outcome classes are represented in the held-out country
+            auc = (
+                roc_auc_score(y_test, pred[test_idx])
+                if len(np.unique(y_test)) == 2
+                else np.nan
+            )
+
+            loco_detail[lab].append({
+                'country': country,
+                'n': int(len(test_idx)),
+                'confirmed': int(y_test.sum()),
+                'nonconfirmed': int((1 - y_test).sum()),
+                'auc': float(auc) if np.isfinite(auc) else None
+            })
+
+        # Retain pooled LOCO performance for comparison with
+        # the original analysis
+        valid = np.isfinite(pred)
+
+        pooled[lab] = (
+            float(roc_auc_score(yl[valid], pred[valid])),
+            float(ks(yl[valid], pred[valid])),
+            int(valid.sum())
+        )
+
+        valid_country_aucs = [
+            r['auc'] for r in loco_detail[lab]
+            if r['auc'] is not None
+        ]
+
+        log(
+            f"LOCO {lab}: pooled AUC={pooled[lab][0]:.4f}; "
+            f"countries evaluated={len(loco_detail[lab])}; "
+            f"mixed-label countries={len(valid_country_aucs)}; "
+            f"mean country AUC="
+            f"{np.mean(valid_country_aucs):.4f}"
+            if valid_country_aucs else
+            f"LOCO {lab}: no mixed-label countries"
+        )
+
+    R['loco'] = pooled
+    R['loco_detail'] = loco_detail
+    save(R)
+
+    log("Country-specific LOCO results saved")
+
+else:
+    log("Country-specific LOCO results already exist; skipping recomputation")
+
+log("Stage 3 completed")
+
+# ==========================================================================
+# EXPORT SUPPLEMENTARY TABLE S18: COUNTRY-SPECIFIC LOCO RESULTS
+# ==========================================================================
+
+import os
+import pandas as pd
+import numpy as np
+
+R = load()
+
+if 'loco_detail' not in R:
+    raise RuntimeError(
+        "Country-specific LOCO results are missing. "
+        "Run the LOCO analysis first."
+    )
+
+# Combine Model A and Model B results by country
+by_country = {}
+
+for lab in ['A', 'B']:
+    for result in R['loco_detail'][lab]:
+        country = result['country']
+        by_country.setdefault(country, {})[lab] = result
+
+rows = []
+
+for country in sorted(by_country):
+
+    a = by_country[country].get('A', {})
+    b = by_country[country].get('B', {})
+
+    # Retain countries with both outcome classes
+    # in the held-out country
+    if a.get('auc') is None and b.get('auc') is None:
+        continue
+
+    ref = a if a else b
+
+    rows.append({
+        'Held-out country': country,
+        'Records': ref['n'],
+        'Confirmed': ref['confirmed'],
+        'Non-confirmed': ref['nonconfirmed'],
+        'Model A AUC': a.get('auc'),
+        'Model B AUC': b.get('auc')
+    })
+
+table18 = pd.DataFrame(rows)
+
+# Add country-level means as a separate summary row
+mean_row = {
+    'Held-out country': 'Mean across eligible countries',
+    'Records': np.nan,
+    'Confirmed': np.nan,
+    'Non-confirmed': np.nan,
+    'Model A AUC': table18['Model A AUC'].mean(),
+    'Model B AUC': table18['Model B AUC'].mean()
+}
+
+table18 = pd.concat(
+    [table18, pd.DataFrame([mean_row])],
+    ignore_index=True
+)
+
+# Export CSV
+csv_path = os.path.join(OUTDIR, 'table_S18_country_LOCO.csv')
+table18.to_csv(csv_path, index=False)
+
+# LaTeX formatting
+def fmt_auc(x):
+    return '--' if pd.isna(x) else f'{x:.3f}'
+
+latex_rows = []
+
+for _, row in table18.iterrows():
+
+    if row['Held-out country'] == 'Mean across eligible countries':
+        latex_rows.append(
+            'Mean across eligible countries & -- & -- & -- & '
+            f'{fmt_auc(row["Model A AUC"])} & '
+            f'{fmt_auc(row["Model B AUC"])} \\\\'
+        )
+    else:
+        country = str(row['Held-out country']).replace('&', r'\&')
+
+        latex_rows.append(
+            f'{country} & '
+            f'{int(row["Records"]):,} & '
+            f'{int(row["Confirmed"]):,} & '
+            f'{int(row["Non-confirmed"]):,} & '
+            f'{fmt_auc(row["Model A AUC"])} & '
+            f'{fmt_auc(row["Model B AUC"])} \\\\'
+        )
+
+latex = r"""
+\begin{table}[htbp]
+\centering
+\caption{Country-specific leave-one-country-out discrimination
+for Models A and B.}
+\label{tab:loco_country_auc}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccc}
+\hline
+Held-out country & Records & Confirmed & Non-confirmed &
+Model A AUC & Model B AUC \\
+\hline
+""" + '\n'.join(latex_rows) + r"""
+\hline
+\end{tabular}%
+}
+\begin{flushleft}
+\footnotesize
+\textit{Note.} Each country was held out in turn, with model
+fitting and preprocessing performed using the remaining countries.
+Country-specific ROC-AUC is reported only for countries containing
+both outcome classes. The final row gives the unweighted mean
+across countries with defined AUCs.
+\end{flushleft}
+\end{table}
+"""
+
+tex_path = os.path.join(OUTDIR, 'table_S18_country_LOCO.tex')
+
+with open(tex_path, 'w', encoding='utf-8') as f:
+    f.write(latex)
+
+print("\nSupplementary Table S18 generated.")
+print(f"Eligible mixed-label countries: {len(rows)-1}")
+print(f"CSV: {csv_path}")
+print(f"LaTeX: {tex_path}")
+print(table18.to_string(index=False))
